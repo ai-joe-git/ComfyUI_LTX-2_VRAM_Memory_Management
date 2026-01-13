@@ -23,8 +23,6 @@ LTX-2's FeedForward layers create massive intermediate tensors that normally lim
 
 *Results may vary based on your system configuration*
 
-<img width="766" height="413" alt="image" src="https://github.com/user-attachments/assets/d7a6690a-612d-4239-a856-0dc2a5b18816" />
-
 
 ## 🚀 Installation
 
@@ -38,6 +36,8 @@ Restart everything.
 
 ### V3 - Single GPU (Recommended)
 **Node name:** `Tensor Parallel V3 (Safe FFN Chunking)`
+
+<img width="766" height="413" alt="image" src="https://github.com/user-attachments/assets/d7a6690a-612d-4239-a856-0dc2a5b18816" />
 
 Best for most users. Works reliably with ComfyUI's memory management.
 
@@ -53,6 +53,7 @@ Best for most users. Works reliably with ComfyUI's memory management.
 
 ### V2 - Multi-GPU (Experimental)
 **Node name:** `Tensor Parallel V2 + Chunked FFN`
+
 <img width="780" height="415" alt="image" src="https://github.com/user-attachments/assets/d906d458-eb63-4371-bee3-b19a8b044da9" />
 
 For users with multiple GPUs who want faster generation. Distributes attention computation across GPUs.
