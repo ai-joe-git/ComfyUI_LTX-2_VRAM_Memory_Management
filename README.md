@@ -14,11 +14,11 @@ LTX-2's FeedForward layers create massive intermediate tensors that normally lim
 | OOM errors | Smooth generation |
 | Need multi-GPU | Single GPU works! |
 
-## 📊 Benchmarks (RTX 4090 24GB)
+## 📊 Benchmarks (RTX 4090 24GB Single GPU Version (V3))
 
 | Resolution | Frames | VRAM Used | Time |
 |------------|--------|-----------|------|
-| 1920×1088 | 800 | ~16.5 GB | ~24 min |
+| 1920×1088 | 800 | ~16.5 GB | ~15 min |
 | 1920×1088 | 900 | ~18.5 GB | ~27 min |
 
 *Results may vary based on your system configuration*
@@ -68,7 +68,6 @@ For users with multiple GPUs who want faster generation. Distributes attention c
 - Faster than V3 but memory distribution is uneven
 - GPU 0 uses more VRAM than others
 - May require experimentation with settings
-- Best results with ComfyUI's offloading **disabled**
 
 ## 💡 Tips
 
@@ -87,7 +86,6 @@ For users with multiple GPUs who want faster generation. Distributes attention c
 4. **For V2 multi-GPU:**
    - Disable ComfyUI's lowvram/offloading mode
    - Expect GPU 0 to use more memory than others
-   - Try `ffn_chunks=12` for 1000+ frames
 
 ## 🔧 Compatibility
 
@@ -122,9 +120,9 @@ Peak memory: ~0.46 GB instead of ~3.7 GB per layer!
 
 ## 🙏 Credits
 
-- **Implementation:** Claude (Anthropic) + Aaron
+- **Implementation:** Claude (Anthropic) + RandomInternetPreson
 - **Tensor Parallelism Concepts (V2):** Inspired by [NVIDIA Megatron-LM](https://github.com/NVIDIA/Megatron-LM)
-- **Testing & Development:** Aaron ([@RandomInternetPreson](https://github.com/RandomInternetPreson))
+- **Testing & Development:** RandomInternetPreson ([@RandomInternetPreson](https://github.com/RandomInternetPreson))
 
 ## 📝 License
 
