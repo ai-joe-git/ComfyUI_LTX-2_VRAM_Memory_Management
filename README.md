@@ -1,3 +1,5 @@
+**Updates coming stay tuned**
+
 # ComfyUI LTX-2 VRAM Memory Management
 
 **Generate extremely long videos with LTX-2 on consumer GPUs!**
