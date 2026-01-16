@@ -119,7 +119,7 @@ Concatenate → Full output
 Peak memory: ~0.46 GB instead of ~3.7 GB per layer!
 ```
 
-### V5 - Multi-GPU Sequence Parallelism with Ring Attention Made for I2V (NEW! You need a lot of VRAM)
+### V5 - Multi-GPU Sequence Parallelism with Ring Attention Made for I2V and T2V (NEW! You need a lot of VRAM)
 **Node name:** `Tensor Parallel V5 (Sequence Parallel + Ring Attention)`
 <img width="676" height="292" alt="image" src="https://github.com/user-attachments/assets/1d19d751-4473-45d1-bad8-7d37dfa33aa0" />
 
