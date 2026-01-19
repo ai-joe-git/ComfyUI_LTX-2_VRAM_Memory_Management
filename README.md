@@ -1,3 +1,12 @@
+**Update**
+
+Okay, I'll fix the naming convention later, but if you are on:
+
+- One gpu use V3; and check out the FasterVersions folder for a potentially better version
+- Two gpus; use sequence_chunked_blocks for I2V 
+- Three+ gpus; use ltx_multi_gpu_chunked for I2V
+Not everythign is documented, try T2V with I2V nodes; I'll be doing more testing myself but these work.  I've only tested with fp8-distilled.
+
 **Try the faster versions if you are having issues: Sorry for the crummy naming scheme, I'll sort that out later.  Right now try out these v5 and v3 replacements, V5 should be much faster and more efficient; V3 I think should be improved too**
 
 **Updates coming stay tuned**
@@ -56,6 +65,145 @@ Best for most users. Works reliably with ComfyUI's memory management.
 ```
 [Load Model] → [Tensor Parallel V3] → [Rest of workflow...]
 ```
+
+### LTX Multi-GPU Chunked
+
+<img width="790" height="694" alt="image" src="https://github.com/user-attachments/assets/4badffe7-a5b2-42b8-80c4-0192291886b8" />
+
+This ComfyUI custom node enables **massive video generation** with LTX-2 by distributing VRAM across multiple GPUs. Generate videos that would be impossible on a single GPU!
+
+**More GPUs = More Frames!**
+
+## The Problem
+
+LTX-2's Stage 2 (high-resolution refinement) creates enormous tensors:
+- **168,960 tokens** for a 700-frame video
+- **17+ GB** just for timestep embeddings
+- **Multiple large tensors** (positional embeddings, attention K/V, etc.)
+
+Even a 24GB RTX 4090 can't hold all of this at once. Standard approaches fail because:
+1. Tensors are created on GPU 0 before any processing begins
+2. By the time hooks run, GPU 0 is already full
+3. Simply adding more GPUs doesn't help if everything starts on GPU 0
+
+## The Solution: "Process Once, Immediately Chunk & Offload"
+
+Our breakthrough strategy intercepts at the **earliest possible point** - the `_forward()` method - and implements a strict discipline:
+
+```
+1. Create tensor on GPU 0
+2. IMMEDIATELY chunk it
+3. IMMEDIATELY distribute chunks to storage GPUs
+4. GPU 0 is now FREE for the next tensor
+5. Repeat
+```
+
+This keeps GPU 0 at ~1.5GB throughout processing, even when handling 17GB tensors!
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        GPU 0 (Compute)                          │
+│                      Stays at ~1.5-2GB!                         │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Process one chunk at a time:                            │   │
+│  │  • Compute K, V for chunk → send to storage              │   │
+│  │  • Compute Q for chunk → attend to full K/V              │   │
+│  │  • Store output → send to storage                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+                              ↕ Round-Robin Distribution
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│   GPU 1     │  │   GPU 2     │  │   GPU 3     │  │   GPU N     │
+│  (Storage)  │  │  (Storage)  │  │  (Storage)  │  │  (Storage)  │
+│             │  │             │  │             │  │             │
+│ Chunks:     │  │ Chunks:     │  │ Chunks:     │  │ Chunks:     │
+│ 0, 3, 6...  │  │ 1, 4, 7...  │  │ 2, 5, 8...  │  │ ...         │
+│             │  │             │  │             │  │             │
+│ ~8-12GB     │  │ ~8-12GB     │  │ ~8-12GB     │  │ ~8-12GB     │
+└─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘
+```
+
+## How It Works
+
+### Phase 1: Input Processing & Immediate Offload
+
+```python
+# 1. Process input (creates patchified tokens on GPU 0)
+x_full = self._process_input(...)  # ~2.7GB on GPU 0
+
+# 2. IMMEDIATELY chunk and distribute
+for chunk_idx in range(num_chunks):
+    chunk = x_full[:, start:end, :]
+    chunk.to(f'cuda:{storage_gpus[chunk_idx % num_storage]}')
+
+del x_full  # GPU 0 is FREE again!
+```
+
+### Phase 2: Timestep Processing & Immediate Offload
+
+```python
+# 1. Prepare timestep (creates HUGE 17GB tensor on GPU 0)
+timestep_full = self._prepare_timestep(...)  # 17GB on GPU 0!
+
+# 2. IMMEDIATELY chunk and distribute
+for chunk_idx in range(num_chunks):
+    chunk = timestep_full[:, start:end, :]
+    chunk.to(storage_gpu)
+
+del timestep_full  # GPU 0 back to ~1.5GB!
+```
+
+### Phase 3: Positional Embeddings & Immediate Offload
+
+Same pattern - create, immediately chunk, immediately offload.
+
+### Phase 4: Transformer Blocks with Chunked Attention
+
+For each of the 48 transformer blocks:
+
+```python
+# Step 1: Compute K, V for ALL chunks (store on storage GPUs)
+for chunk_idx in range(num_chunks):
+    vx_chunk = get_chunk_from_storage(chunk_idx)  # Bring to GPU 0
+    k, v = compute_kv(vx_chunk)
+    store_on_storage_gpu(k, v, chunk_idx)
+    del vx_chunk  # GPU 0 stays free
+
+# Concatenate K, V on first storage GPU for global attention
+k_full = concatenate_all_k_chunks()
+v_full = concatenate_all_v_chunks()
+
+# Step 2: Compute Q for each chunk, attend to FULL K, V
+for chunk_idx in range(num_chunks):
+    vx_chunk = get_chunk_from_storage(chunk_idx)
+    q = compute_q(vx_chunk)
+    
+    # Attention with GLOBAL context (all 168K tokens!)
+    output = attention(q, k_full, v_full)
+    
+    store_on_storage_gpu(output, chunk_idx)
+    del vx_chunk, q, output  # GPU 0 stays free
+```
+
+### Phase 5: Gather & Output
+
+```python
+# Gather all chunks back to GPU 0
+vx_final = concatenate_all_chunks()
+
+# Process output
+output = self._process_output(vx_final, ...)
+```
+
+
+
+
+
+
+
+
 
 ### V2 - Multi-GPU (Experimental - Use V5 tensor parallelism with ring attention for multi-gpu experimentation)
 **Node name:** `Tensor Parallel V2 + Chunked FFN`
