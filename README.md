@@ -6,7 +6,13 @@ Okay, I'll fix the naming convention later, but if you are on:
 - Two gpus; use sequence_chunked_blocks for I2V (might try ltx_multi_gpu_chunked)
 - Three+ gpus; use ltx_multi_gpu_chunked for I2V
 
-Not everythign is documented, try T2V with I2V nodes; I'll be doing more testing myself but these work.  I've only tested with fp8-distilled.
+Not everything is documented, try T2V with I2V nodes; I'll be doing more testing myself but these work.  I've only tested with fp8-distilled.
+
+**Update on Issue Submission**
+
+I will try to address issues, but I am very new to ComfyUI and this code is in a state of flux.  Trust me, you likely know ComfyUI better than I.  Give me a few days to sort out the repo and provide better documentation.
+
+
 
 **Try the faster versions if you are having issues: Sorry for the crummy naming scheme, I'll sort that out later.  Right now try out these v5 and v3 replacements, V5 should be much faster and more efficient; V3 I think should be improved too**
 
