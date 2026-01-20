@@ -334,6 +334,9 @@ With 7 GPUs (6 active for sequence):
 - **Tensor Parallelism Concepts (V2):** Inspired by [NVIDIA Megatron-LM](https://github.com/NVIDIA/Megatron-LM)
 - **Testing & Development:** RandomInternetPreson ([@RandomInternetPreson](https://github.com/RandomInternetPreson))
 - **Workflow:** @yanokusnir Got good work flow from here: https://www.reddit.com/r/StableDiffusion/comments/1qae922/ltx2_i2v_isnt_perfect_but_its_still_awesome_my/
+- **Cyber Lady Image** https://www.freepik.com/free-ai-image/portrait-woman-with-cool-futuristic-superhero-suit_81425542.htm#fromView=search&page=1&position=9&uuid=c9a8e307-825f-4eca-9a86-a7bb62ea0600&query=woman+cyberpunk
+
+
 ## 📝 License
 
 MIT License - Feel free to use, modify, and distribute!
