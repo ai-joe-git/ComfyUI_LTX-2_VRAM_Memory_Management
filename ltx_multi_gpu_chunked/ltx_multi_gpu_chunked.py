@@ -472,6 +472,28 @@ def _chunked_forward_v6(
     import comfy.ldm.common_dit
     import comfy.ldm.modules.attention as attn_module
     from comfy.ldm.lightricks.model import apply_rotary_emb
+    import gc
+    
+    # ================================================================
+    # INITIAL CLEANUP: Clear any leftover memory from previous passes
+    # ================================================================
+    gc.collect()
+    torch.cuda.empty_cache()
+    for gpu_id in _config.storage_gpus:
+        with torch.cuda.device(gpu_id):
+            torch.cuda.empty_cache()
+    
+    # Log context tensor sizes (these come from outside and could be large!)
+    if _config.verbose >= 1:
+        if context is not None:
+            if isinstance(context, (list, tuple)):
+                for i, ctx in enumerate(context):
+                    if ctx is not None and hasattr(ctx, 'shape'):
+                        ctx_size = ctx.numel() * ctx.element_size() / 1024**2
+                        logger.info(f"[FORWARD] Context[{i}] shape: {ctx.shape}, size: {ctx_size:.1f}MB, device: {ctx.device}")
+            elif hasattr(context, 'shape'):
+                ctx_size = context.numel() * context.element_size() / 1024**2
+                logger.info(f"[FORWARD] Context shape: {context.shape}, size: {ctx_size:.1f}MB, device: {context.device}")
     
     compute_device = _config.compute_device
     compute_gpu = _config.compute_gpu
@@ -542,6 +564,56 @@ def _chunked_forward_v6(
         logger.info(f"[FORWARD] GPU{compute_gpu} after vx offload: {mem:.1f}MB")
     
     # ================================================================
+    # TEMPORARILY OFFLOAD CONTEXT during heavy allocation phases
+    # Context can be large with long prompts and competes with timestep/PE allocation
+    # ================================================================
+    
+    context_offloaded = False
+    context_original_devices = []
+    
+    def offload_context_to_storage(ctx):
+        """Move context tensors to storage GPU temporarily."""
+        nonlocal context_offloaded, context_original_devices
+        if ctx is None:
+            return ctx
+        
+        if isinstance(ctx, (list, tuple)):
+            result = []
+            for item in ctx:
+                result.append(offload_context_to_storage(item))
+            return type(ctx)(result)
+        elif isinstance(ctx, torch.Tensor) and ctx.device.type == 'cuda' and ctx.device.index == compute_gpu:
+            context_original_devices.append(ctx.device)
+            context_offloaded = True
+            return ctx.to(first_storage, non_blocking=True)
+        else:
+            context_original_devices.append(getattr(ctx, 'device', None))
+            return ctx
+    
+    def restore_context_to_compute(ctx):
+        """Move context back to compute GPU."""
+        if ctx is None:
+            return ctx
+        
+        if isinstance(ctx, (list, tuple)):
+            result = []
+            for item in ctx:
+                result.append(restore_context_to_compute(item))
+            return type(ctx)(result)
+        elif isinstance(ctx, torch.Tensor) and ctx.device.type == 'cuda' and ctx.device.index == first_storage_id:
+            return ctx.to(compute_device, non_blocking=True)
+        else:
+            return ctx
+    
+    # Offload context before heavy allocations
+    context = offload_context_to_storage(context)
+    if context_offloaded:
+        torch.cuda.synchronize(first_storage_id)
+        torch.cuda.empty_cache()
+        if _config.verbose >= 1:
+            logger.info(f"[FORWARD] Context offloaded to storage GPU for timestep allocation")
+    
+    # ================================================================
     # STEP 2: Prepare timestep (creates huge timestep tensors on GPU0)
     # Then IMMEDIATELY chunk and offload
     # ================================================================
@@ -549,7 +621,18 @@ def _chunked_forward_v6(
     if _config.verbose >= 1:
         logger.info(f"[FORWARD] Step 2: Preparing timestep...")
         mem = torch.cuda.memory_allocated(compute_gpu) / 1024**2
-        logger.info(f"[FORWARD] GPU{compute_gpu} before _prepare_timestep: {mem:.1f}MB")
+        reserved = torch.cuda.memory_reserved(compute_gpu) / 1024**2
+        logger.info(f"[FORWARD] GPU{compute_gpu} before _prepare_timestep: {mem:.1f}MB allocated, {reserved:.1f}MB reserved")
+        
+        # Log all GPU memory
+        for gpu_id in [compute_gpu] + list(_config.storage_gpus):
+            alloc = torch.cuda.memory_allocated(gpu_id) / 1024**2
+            res = torch.cuda.memory_reserved(gpu_id) / 1024**2
+            logger.info(f"[FORWARD]   GPU{gpu_id}: {alloc:.1f}MB allocated, {res:.1f}MB reserved")
+    
+    # Force cleanup right before the big allocation
+    gc.collect()
+    torch.cuda.empty_cache()
     
     timestep_full, embedded_timestep_full = self._prepare_timestep(
         timestep, batch_size, input_dtype, **merged_args
@@ -578,7 +661,7 @@ def _chunked_forward_v6(
         logger.info(f"[FORWARD] GPU{compute_gpu} after timestep offload: {mem:.1f}MB")
     
     # ================================================================
-    # STEP 3: Prepare context (small, keep on compute)
+    # STEP 3: Prepare context
     # ================================================================
     
     # We need a reference x for context preparation - use first chunk temporarily
@@ -590,16 +673,37 @@ def _chunked_forward_v6(
     else:
         x_ref = vx_ref
     
+    # Restore context to compute GPU before _prepare_context
+    if context_offloaded:
+        context = restore_context_to_compute(context)
+        torch.cuda.synchronize(compute_gpu)
+        if _config.verbose >= 1:
+            logger.info(f"[FORWARD] Context restored to compute GPU for context preparation")
+    
     context_prepared, attention_mask_prepared = self._prepare_context(
         context, batch_size, x_ref, attention_mask
     )
     attention_mask_prepared = self._prepare_attention_mask(attention_mask_prepared, input_dtype)
     
     del vx_ref, x_ref
-    torch.cuda.empty_cache()
     
-    # Context is small, keep on compute device or move to first storage
-    # Actually, we need it for every attention, so keep on compute
+    # Offload context_prepared during PE allocation (it can be large!)
+    context_prepared_offloaded = False
+    if isinstance(context_prepared, (list, tuple)):
+        has_gpu0_tensors = any(
+            isinstance(t, torch.Tensor) and t.device.type == 'cuda' and t.device.index == compute_gpu
+            for t in context_prepared if t is not None
+        )
+        if has_gpu0_tensors:
+            context_prepared = offload_context_to_storage(context_prepared)
+            context_prepared_offloaded = True
+            torch.cuda.synchronize(first_storage_id)
+    elif isinstance(context_prepared, torch.Tensor) and context_prepared.device.type == 'cuda' and context_prepared.device.index == compute_gpu:
+        context_prepared = context_prepared.to(first_storage, non_blocking=True)
+        context_prepared_offloaded = True
+        torch.cuda.synchronize(first_storage_id)
+    
+    torch.cuda.empty_cache()
     
     # ================================================================
     # STEP 4: Prepare positional embeddings (creates huge PE on GPU0)
@@ -621,6 +725,11 @@ def _chunked_forward_v6(
     pe_storage, pe_num_chunks = chunk_pe_structure(pe_full, chunk_size, v_seq_len, _config)
     del pe_full
     torch.cuda.empty_cache()
+    
+    # Restore context_prepared after PE is offloaded
+    if context_prepared_offloaded:
+        context_prepared = restore_context_to_compute(context_prepared)
+        torch.cuda.synchronize(compute_gpu)
     
     if _config.verbose >= 1:
         mem = torch.cuda.memory_allocated(compute_gpu) / 1024**2
@@ -1151,6 +1260,77 @@ def _chunked_forward_v6(
     if _config.verbose >= 1:
         mem = torch.cuda.memory_allocated(compute_gpu) / 1024**2
         logger.info(f"[FORWARD] Complete. GPU{compute_gpu}: {mem:.1f}MB")
+    
+    # ================================================================
+    # CRITICAL CLEANUP: Free all intermediate tensors to prevent OOM on next pass
+    # ================================================================
+    
+    # Delete chunk storage
+    del vx_chunks, vx_final
+    if 'x_final' in dir():
+        del x_final
+    
+    # Delete timestep storage
+    def delete_nested(storage):
+        """Recursively delete nested storage structures."""
+        if storage is None:
+            return
+        if isinstance(storage, list):
+            for item in storage:
+                delete_nested(item)
+            storage.clear()
+        elif isinstance(storage, torch.Tensor):
+            del storage
+    
+    delete_nested(timestep_storage)
+    delete_nested(emb_ts_storage)
+    delete_nested(pe_storage)
+    
+    # Delete context tensors (these can be large with long prompts!)
+    if 'v_context' in dir() and v_context is not None:
+        del v_context
+    if 'a_context' in dir() and a_context is not None:
+        del a_context
+    if 'context_prepared' in dir():
+        del context_prepared
+    
+    # Delete audio tensors
+    if 'ax_compute' in dir() and ax_compute is not None:
+        del ax_compute
+    if 'ax_storage' in dir() and ax_storage is not None:
+        del ax_storage
+    if 'a_timestep' in dir() and a_timestep is not None:
+        del a_timestep
+    if 'av_ca_audio_scale_shift' in dir() and av_ca_audio_scale_shift is not None:
+        del av_ca_audio_scale_shift
+    if 'av_ca_video_scale_shift' in dir() and av_ca_video_scale_shift is not None:
+        del av_ca_video_scale_shift
+    if 'av_ca_a2v_gate' in dir() and av_ca_a2v_gate is not None:
+        del av_ca_a2v_gate
+    if 'av_ca_v2a_gate' in dir() and av_ca_v2a_gate is not None:
+        del av_ca_v2a_gate
+    if 'a_pe' in dir() and a_pe is not None:
+        del a_pe
+    if 'a_cross_pe' in dir() and a_cross_pe is not None:
+        del a_cross_pe
+    
+    # Delete other intermediates
+    if 'emb_ts_compute' in dir():
+        del emb_ts_compute
+    if 'attention_mask_prepared' in dir():
+        del attention_mask_prepared
+    
+    # Force cleanup on all GPUs
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    for gpu_id in _config.storage_gpus:
+        with torch.cuda.device(gpu_id):
+            torch.cuda.empty_cache()
+    
+    if _config.verbose >= 2:
+        mem = torch.cuda.memory_allocated(compute_gpu) / 1024**2
+        logger.info(f"[FORWARD] After cleanup GPU{compute_gpu}: {mem:.1f}MB")
     
     return output
 
