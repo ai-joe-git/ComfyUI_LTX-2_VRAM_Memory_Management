@@ -634,27 +634,198 @@ def _chunked_forward_v6(
     gc.collect()
     torch.cuda.empty_cache()
     
-    timestep_full, embedded_timestep_full = self._prepare_timestep(
-        timestep, batch_size, input_dtype, **merged_args
-    )
+    # ================================================================
+    # CHUNKED TIMESTEP PREPARATION
+    # For very long sequences, adaln_single creates huge intermediate tensors.
+    # We chunk the VIDEO timestep processing while keeping audio as-is.
+    # ================================================================
     
-    if _config.verbose >= 1:
-        mem = torch.cuda.memory_allocated(compute_gpu) / 1024**2
-        logger.info(f"[FORWARD] GPU{compute_gpu} after _prepare_timestep: {mem:.1f}MB")
+    timestep_chunk_size = chunk_size  # Use same chunk size as video tokens
     
-    # IMMEDIATELY chunk and offload timestep
-    timestep_storage, ts_is_chunked = chunk_and_offload_nested(
-        timestep_full, "timestep", chunk_size, v_seq_len, _config, dim=1
-    )
-    del timestep_full
-    torch.cuda.empty_cache()
+    # Check if this is an AV model with separate video/audio timesteps
+    is_av_timestep = hasattr(self, 'audio_adaln_single')
     
-    # IMMEDIATELY chunk and offload embedded_timestep
-    emb_ts_storage, emb_is_chunked = chunk_and_offload_nested(
-        embedded_timestep_full, "embedded_timestep", chunk_size, v_seq_len, _config, dim=1
-    )
-    del embedded_timestep_full
-    torch.cuda.empty_cache()
+    if is_av_timestep and v_seq_len > 60000:
+        # Chunked processing for AV model
+        if _config.verbose >= 1:
+            logger.info(f"[FORWARD] Using CHUNKED timestep preparation for {v_seq_len} tokens")
+        
+        grid_mask = merged_args.get("grid_mask", None)
+        timestep_input = timestep
+        if grid_mask is not None:
+            timestep_input = timestep_input[:, grid_mask]
+        
+        timestep_scaled = timestep_input * self.timestep_scale_multiplier
+        
+        # Process video timestep in chunks
+        v_timestep_chunks = []
+        v_embedded_timestep_chunks = []
+        
+        num_ts_chunks = math.ceil(v_seq_len / timestep_chunk_size)
+        
+        for ts_chunk_idx in range(num_ts_chunks):
+            ts_start = ts_chunk_idx * timestep_chunk_size
+            ts_end = min(ts_start + timestep_chunk_size, v_seq_len)
+            
+            # Get chunk of scaled timestep
+            ts_chunk = timestep_scaled[:, ts_start:ts_end]
+            
+            # Process through adaln_single
+            v_ts_chunk, v_emb_ts_chunk = self.adaln_single(
+                ts_chunk.flatten(),
+                {"resolution": None, "aspect_ratio": None},
+                batch_size=batch_size,
+                hidden_dtype=input_dtype,
+            )
+            
+            # Reshape
+            chunk_len = ts_end - ts_start
+            v_ts_chunk = v_ts_chunk.view(batch_size, chunk_len, v_ts_chunk.shape[-1])
+            v_emb_ts_chunk = v_emb_ts_chunk.view(batch_size, chunk_len, v_emb_ts_chunk.shape[-1])
+            
+            # Offload to storage GPU immediately
+            storage_dev = _config.get_storage_device(ts_chunk_idx)
+            v_timestep_chunks.append((
+                v_ts_chunk.to(storage_dev, non_blocking=True),
+                ts_start, ts_end, storage_dev, _config.get_storage_gpu_id(ts_chunk_idx)
+            ))
+            v_embedded_timestep_chunks.append((
+                v_emb_ts_chunk.to(storage_dev, non_blocking=True),
+                ts_start, ts_end, storage_dev, _config.get_storage_gpu_id(ts_chunk_idx)
+            ))
+            
+            del ts_chunk, v_ts_chunk, v_emb_ts_chunk
+            torch.cuda.empty_cache()
+        
+        # Sync all storage GPUs
+        for gpu_id in _config.storage_gpus:
+            torch.cuda.synchronize(gpu_id)
+        
+        if _config.verbose >= 1:
+            mem = torch.cuda.memory_allocated(compute_gpu) / 1024**2
+            logger.info(f"[FORWARD] GPU{compute_gpu} after chunked video timestep: {mem:.1f}MB")
+        
+        # Process audio timestep (small, don't need to chunk)
+        a_timestep_input = merged_args.get("a_timestep")
+        if a_timestep_input is not None:
+            a_timestep_scaled = a_timestep_input * self.timestep_scale_multiplier
+            av_ca_factor = self.av_ca_timestep_scale_multiplier / self.timestep_scale_multiplier
+            
+            av_ca_audio_scale_shift_timestep, _ = self.av_ca_audio_scale_shift_adaln_single(
+                a_timestep_scaled.flatten(),
+                {"resolution": None, "aspect_ratio": None},
+                batch_size=batch_size,
+                hidden_dtype=input_dtype,
+            )
+            
+            # For cross-attention video timestep, we also need to chunk
+            av_ca_video_chunks = []
+            av_ca_a2v_gate_chunks = []
+            
+            for ts_chunk_idx in range(num_ts_chunks):
+                ts_start = ts_chunk_idx * timestep_chunk_size
+                ts_end = min(ts_start + timestep_chunk_size, v_seq_len)
+                ts_chunk = timestep_scaled[:, ts_start:ts_end]
+                
+                av_ca_video_ss_chunk, _ = self.av_ca_video_scale_shift_adaln_single(
+                    ts_chunk.flatten(),
+                    {"resolution": None, "aspect_ratio": None},
+                    batch_size=batch_size,
+                    hidden_dtype=input_dtype,
+                )
+                av_ca_a2v_gate_chunk, _ = self.av_ca_a2v_gate_adaln_single(
+                    ts_chunk.flatten() * av_ca_factor,
+                    {"resolution": None, "aspect_ratio": None},
+                    batch_size=batch_size,
+                    hidden_dtype=input_dtype,
+                )
+                
+                chunk_len = ts_end - ts_start
+                av_ca_video_ss_chunk = av_ca_video_ss_chunk.view(batch_size, chunk_len, -1)
+                av_ca_a2v_gate_chunk = av_ca_a2v_gate_chunk.view(batch_size, chunk_len, -1)
+                
+                storage_dev = _config.get_storage_device(ts_chunk_idx)
+                av_ca_video_chunks.append((
+                    av_ca_video_ss_chunk.to(storage_dev, non_blocking=True),
+                    ts_start, ts_end, storage_dev, _config.get_storage_gpu_id(ts_chunk_idx)
+                ))
+                av_ca_a2v_gate_chunks.append((
+                    av_ca_a2v_gate_chunk.to(storage_dev, non_blocking=True),
+                    ts_start, ts_end, storage_dev, _config.get_storage_gpu_id(ts_chunk_idx)
+                ))
+                
+                del ts_chunk, av_ca_video_ss_chunk, av_ca_a2v_gate_chunk
+                torch.cuda.empty_cache()
+            
+            # v2a gate uses audio timestep (small)
+            av_ca_v2a_gate_noise_timestep, _ = self.av_ca_v2a_gate_adaln_single(
+                a_timestep_scaled.flatten() * av_ca_factor,
+                {"resolution": None, "aspect_ratio": None},
+                batch_size=batch_size,
+                hidden_dtype=input_dtype,
+            )
+            
+            a_timestep_out, a_embedded_timestep = self.audio_adaln_single(
+                a_timestep_scaled.flatten(),
+                {"resolution": None, "aspect_ratio": None},
+                batch_size=batch_size,
+                hidden_dtype=input_dtype,
+            )
+            a_seq_len = a_timestep_input.shape[1] if a_timestep_input.dim() > 1 else 1
+            a_timestep_out = a_timestep_out.view(batch_size, -1, a_timestep_out.shape[-1])
+            a_embedded_timestep = a_embedded_timestep.view(batch_size, -1, a_embedded_timestep.shape[-1])
+            
+            av_ca_audio_scale_shift_timestep = av_ca_audio_scale_shift_timestep.view(batch_size, -1, av_ca_audio_scale_shift_timestep.shape[-1])
+            av_ca_v2a_gate_noise_timestep = av_ca_v2a_gate_noise_timestep.view(batch_size, -1, av_ca_v2a_gate_noise_timestep.shape[-1])
+            
+            # Store on first storage GPU (small tensors)
+            a_timestep_storage = a_timestep_out.to(first_storage, non_blocking=True)
+            a_embedded_timestep_storage = a_embedded_timestep.to(first_storage, non_blocking=True)
+            av_ca_audio_ss_storage = av_ca_audio_scale_shift_timestep.to(first_storage, non_blocking=True)
+            av_ca_v2a_gate_storage = av_ca_v2a_gate_noise_timestep.to(first_storage, non_blocking=True)
+            
+            del a_timestep_out, a_embedded_timestep, av_ca_audio_scale_shift_timestep, av_ca_v2a_gate_noise_timestep
+            torch.cuda.empty_cache()
+            
+            # Build storage structures
+            timestep_storage = [v_timestep_chunks, a_timestep_storage, (av_ca_audio_ss_storage, av_ca_video_chunks, av_ca_a2v_gate_chunks, av_ca_v2a_gate_storage)]
+            emb_ts_storage = [v_embedded_timestep_chunks, a_embedded_timestep_storage]
+            ts_is_chunked = True
+            emb_is_chunked = True
+        else:
+            # No audio timestep
+            timestep_storage = [v_timestep_chunks, None, []]
+            emb_ts_storage = [v_embedded_timestep_chunks, None]
+            ts_is_chunked = True
+            emb_is_chunked = True
+        
+        if _config.verbose >= 1:
+            mem = torch.cuda.memory_allocated(compute_gpu) / 1024**2
+            logger.info(f"[FORWARD] GPU{compute_gpu} after all timestep prep: {mem:.1f}MB")
+    
+    else:
+        # Original non-chunked path for smaller sequences
+        timestep_full, embedded_timestep_full = self._prepare_timestep(
+            timestep, batch_size, input_dtype, **merged_args
+        )
+        
+        if _config.verbose >= 1:
+            mem = torch.cuda.memory_allocated(compute_gpu) / 1024**2
+            logger.info(f"[FORWARD] GPU{compute_gpu} after _prepare_timestep: {mem:.1f}MB")
+        
+        # IMMEDIATELY chunk and offload timestep
+        timestep_storage, ts_is_chunked = chunk_and_offload_nested(
+            timestep_full, "timestep", chunk_size, v_seq_len, _config, dim=1
+        )
+        del timestep_full
+        torch.cuda.empty_cache()
+        
+        # IMMEDIATELY chunk and offload embedded_timestep
+        emb_ts_storage, emb_is_chunked = chunk_and_offload_nested(
+            embedded_timestep_full, "embedded_timestep", chunk_size, v_seq_len, _config, dim=1
+        )
+        del embedded_timestep_full
+        torch.cuda.empty_cache()
     
     if _config.verbose >= 1:
         mem = torch.cuda.memory_allocated(compute_gpu) / 1024**2
@@ -781,6 +952,9 @@ def _chunked_forward_v6(
                 # It was chunked, gather it (shouldn't happen for audio but just in case)
                 a_timestep = torch.cat([c.to(compute_device) for c, _, _, _, _ in a_ts_storage], dim=1)
             torch.cuda.synchronize(compute_gpu)
+            # Ensure correct dtype (adaln_single may use float32 internally)
+            if a_timestep is not None:
+                a_timestep = a_timestep.to(input_dtype)
         
         # Get cross-attention timesteps (index 2 in timestep structure)
         if isinstance(timestep_storage, (list, tuple)) and len(timestep_storage) > 2:
@@ -791,9 +965,11 @@ def _chunked_forward_v6(
                     if item is None:
                         return None
                     if isinstance(item, torch.Tensor):
-                        return item.to(compute_device, non_blocking=True)
+                        result = item.to(compute_device, non_blocking=True)
+                        return result.to(input_dtype)  # Ensure correct dtype
                     if is_chunked_tensor_list(item):
-                        return torch.cat([c.to(compute_device) for c, _, _, _, _ in item], dim=1)
+                        result = torch.cat([c.to(compute_device) for c, _, _, _, _ in item], dim=1)
+                        return result.to(input_dtype)  # Ensure correct dtype
                     return item
                 
                 av_ca_audio_scale_shift = get_full_tensor(ca_timesteps[0])
@@ -834,11 +1010,14 @@ def _chunked_forward_v6(
                 torch.cuda.synchronize(compute_gpu)
     
     for block_idx, block in enumerate(self.transformer_blocks):
-        if _config.verbose >= 1 and (block_idx % 8 == 0 or block_idx == len(self.transformer_blocks) - 1):
-            mem = torch.cuda.memory_allocated(compute_gpu) / 1024**2
-            logger.info(f"[FORWARD] Block {block_idx+1}/{len(self.transformer_blocks)}, GPU{compute_gpu}: {mem:.1f}MB")
-        
         v_attn1 = block.attn1
+        
+        # Log all GPU memory at block start
+        if _config.verbose >= 1 and (block_idx == 0 or (block_idx + 1) % 8 == 0 or block_idx == len(self.transformer_blocks) - 1):
+            mem_compute = torch.cuda.memory_allocated(compute_gpu) / 1024**2
+            storage_mems = [torch.cuda.memory_allocated(gid) / 1024**2 for gid in _config.storage_gpus]
+            storage_str = ', '.join([f'GPU{gid}:{mem:.0f}MB' for gid, mem in zip(_config.storage_gpus, storage_mems)])
+            logger.info(f"[FORWARD] Block {block_idx+1}/{len(self.transformer_blocks)}, GPU0: {mem_compute:.1f}MB, Storage: [{storage_str}]")
         
         # ============================================================
         # PART A: Compute K, V for all video chunks
@@ -988,16 +1167,24 @@ def _chunked_forward_v6(
         # PART C: Audio self-attention + text cross-attention
         # ============================================================
         if is_av_model and ax_compute is not None and ax_compute.numel() > 0:
+            original_ax_dtype = ax_compute.dtype  # Save original dtype
+            
             # Audio ada values
             ashift_msa, ascale_msa, agate_msa = block.get_ada_values(
                 block.audio_scale_shift_table, batch_size, a_timestep, slice(0, 3)
             )
+            
+            # Ensure ada values match ax_compute dtype
+            ascale_msa = ascale_msa.to(original_ax_dtype)
+            ashift_msa = ashift_msa.to(original_ax_dtype)
+            agate_msa = agate_msa.to(original_ax_dtype)
             
             # Audio self-attention
             norm_ax = comfy.ldm.common_dit.rms_norm(ax_compute) * (1 + ascale_msa) + ashift_msa
             ax_compute = ax_compute + block.audio_attn1(
                 norm_ax, pe=a_pe, transformer_options=transformer_options
             ) * agate_msa
+            ax_compute = ax_compute.to(original_ax_dtype)  # Ensure dtype preserved
             del norm_ax, ashift_msa, ascale_msa, agate_msa
             
             # Audio text cross-attention
@@ -1008,6 +1195,7 @@ def _chunked_forward_v6(
                     mask=attention_mask_prepared,
                     transformer_options=transformer_options,
                 )
+                ax_compute = ax_compute.to(original_ax_dtype)  # Ensure dtype preserved
         
         # ============================================================
         # PART D: Cross-modal attention (a2v and v2a)
@@ -1031,6 +1219,12 @@ def _chunked_forward_v6(
                         av_ca_audio_scale_shift,
                         av_ca_v2a_gate,
                     )
+                    # Ensure correct dtype
+                    scale_ca_audio_a2v = scale_ca_audio_a2v.to(input_dtype)
+                    shift_ca_audio_a2v = shift_ca_audio_a2v.to(input_dtype)
+                    scale_ca_audio_v2a = scale_ca_audio_v2a.to(input_dtype)
+                    shift_ca_audio_v2a = shift_ca_audio_v2a.to(input_dtype)
+                    gate_out_v2a = gate_out_v2a.to(input_dtype)
                 else:
                     run_a2v = False
                     run_v2a = False
@@ -1056,15 +1250,34 @@ def _chunked_forward_v6(
                         
                         # Get video cross-attention ada values (per chunk if needed)
                         if av_ca_video_scale_shift is not None and av_ca_a2v_gate is not None:
-                            # Check if these are per-token (have seq dimension matching full video)
-                            # If so, we need to slice them for this chunk
-                            v_ca_ss = av_ca_video_scale_shift
-                            v_ca_gate = av_ca_a2v_gate
+                            # Handle chunked or non-chunked av_ca tensors
+                            if is_chunked_tensor_list(av_ca_video_scale_shift):
+                                # Chunked - get the chunk for this index
+                                v_ca_ss_data, _, _, _, _ = av_ca_video_scale_shift[chunk_idx]
+                                v_ca_ss = v_ca_ss_data.to(compute_device, non_blocking=True)
+                            elif isinstance(av_ca_video_scale_shift, torch.Tensor):
+                                v_ca_ss = av_ca_video_scale_shift
+                                if v_ca_ss.dim() > 1 and v_ca_ss.shape[1] == v_seq_len:
+                                    v_ca_ss = v_ca_ss[:, start:end].to(compute_device, non_blocking=True)
+                                else:
+                                    v_ca_ss = v_ca_ss.to(compute_device, non_blocking=True)
+                            else:
+                                v_ca_ss = av_ca_video_scale_shift
                             
-                            if v_ca_ss.dim() > 1 and v_ca_ss.shape[1] == v_seq_len:
-                                v_ca_ss = v_ca_ss[:, start:end]
-                            if v_ca_gate.dim() > 1 and v_ca_gate.shape[1] == v_seq_len:
-                                v_ca_gate = v_ca_gate[:, start:end]
+                            if is_chunked_tensor_list(av_ca_a2v_gate):
+                                # Chunked - get the chunk for this index
+                                v_ca_gate_data, _, _, _, _ = av_ca_a2v_gate[chunk_idx]
+                                v_ca_gate = v_ca_gate_data.to(compute_device, non_blocking=True)
+                            elif isinstance(av_ca_a2v_gate, torch.Tensor):
+                                v_ca_gate = av_ca_a2v_gate
+                                if v_ca_gate.dim() > 1 and v_ca_gate.shape[1] == v_seq_len:
+                                    v_ca_gate = v_ca_gate[:, start:end].to(compute_device, non_blocking=True)
+                                else:
+                                    v_ca_gate = v_ca_gate.to(compute_device, non_blocking=True)
+                            else:
+                                v_ca_gate = av_ca_a2v_gate
+                            
+                            torch.cuda.synchronize(compute_gpu)
                             
                             (
                                 scale_ca_video_a2v, shift_ca_video_a2v,
@@ -1091,6 +1304,7 @@ def _chunked_forward_v6(
                             vx_compute = vx_compute + a2v_out
                             del a2v_out, vx_scaled, ax_scaled, vx_norm3
                             del scale_ca_video_a2v, shift_ca_video_a2v, scale_ca_video_v2a_chunk, shift_ca_video_v2a_chunk, gate_out_a2v
+                            del v_ca_ss, v_ca_gate
                         
                         a2v_output_chunks.append((vx_compute.to(storage_device, non_blocking=True), start, end, storage_device, storage_gpu_id))
                         del vx_compute, pe_chunk
@@ -1099,65 +1313,185 @@ def _chunked_forward_v6(
                     # Replace intermediate chunks with a2v output
                     intermediate_vx_chunks = a2v_output_chunks
                 
-                # v2a: Gather full video, add to audio
+                # v2a: Audio attends to full video
+                # CHUNKED APPROACH: Process video chunks where they already live!
+                # This avoids gathering 192K tokens to one GPU.
                 if run_v2a:
-                    # Gather full video temporarily
-                    vx_full_for_v2a = torch.cat([c.to(compute_device) for c, _, _, _, _ in intermediate_vx_chunks], dim=1)
-                    torch.cuda.synchronize(compute_gpu)
+                    # Get the v2a attention module
+                    v2a_attn = block.video_to_audio_attn
                     
-                    vx_norm3_full = comfy.ldm.common_dit.rms_norm(vx_full_for_v2a)
+                    # Prepare audio query on compute GPU
+                    ax_scaled_v2a = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
                     
-                    # Compute video ada values for FULL video (for v2a)
-                    (
-                        scale_ca_video_a2v_full, shift_ca_video_a2v_full,
-                        scale_ca_video_v2a, shift_ca_video_v2a,
-                        gate_out_a2v_full,
-                    ) = block.get_av_ca_ada_values(
-                        block.scale_shift_table_a2v_ca_video,
-                        vx_full_for_v2a.shape[0],
-                        av_ca_video_scale_shift,
-                        av_ca_a2v_gate,
+                    # Get audio cross PE (small, keep on compute)
+                    a_cross_pe_compute = a_cross_pe
+                    
+                    # Compute audio Q with RoPE on compute GPU
+                    ax_q = v2a_attn.to_q(ax_scaled_v2a)
+                    if hasattr(v2a_attn, 'q_norm') and v2a_attn.q_norm is not None:
+                        ax_q = v2a_attn.q_norm(ax_q)
+                    
+                    # Apply RoPE to Q
+                    if a_cross_pe_compute is not None and isinstance(a_cross_pe_compute, tuple):
+                        ax_q = apply_rotary_emb(ax_q, a_cross_pe_compute)
+                    
+                    # Reshape Q for attention: (batch, heads, audio_seq, head_dim)
+                    batch_size_v2a = ax_q.shape[0]
+                    audio_seq_len = ax_q.shape[1]
+                    num_heads = v2a_attn.heads
+                    head_dim = ax_q.shape[-1] // num_heads
+                    
+                    ax_q = ax_q.view(batch_size_v2a, audio_seq_len, num_heads, head_dim).transpose(1, 2)
+                    
+                    # Initialize chunked attention accumulators
+                    # Using online softmax algorithm for numerical stability
+                    v2a_output_acc = torch.zeros(
+                        batch_size_v2a, num_heads, audio_seq_len, head_dim,
+                        dtype=ax_q.dtype, device=compute_device
+                    )
+                    max_scores = torch.full(
+                        (batch_size_v2a, num_heads, audio_seq_len, 1),
+                        float('-inf'), dtype=torch.float32, device=compute_device
+                    )
+                    sum_exp = torch.zeros(
+                        batch_size_v2a, num_heads, audio_seq_len, 1,
+                        dtype=torch.float32, device=compute_device
                     )
                     
-                    # Get full video cross PE
-                    v_cross_pe_chunks = []
-                    for chunk_idx in range(num_chunks):
-                        pe_chunk = get_pe_chunk(pe_storage, chunk_idx, compute_device, compute_gpu)
+                    scale = head_dim ** -0.5
+                    
+                    # Process each video chunk on its storage GPU
+                    for v2a_chunk_idx in range(num_chunks):
+                        vx_data, start, end, storage_device, storage_gpu_id = intermediate_vx_chunks[v2a_chunk_idx]
+                        chunk_len = end - start
+                        
+                        # Move audio Q to this storage GPU
+                        ax_q_storage = ax_q.to(storage_device, non_blocking=True)
+                        torch.cuda.synchronize(storage_gpu_id)
+                        
+                        # Get video chunk (already on this storage GPU)
+                        vx_chunk = vx_data  # Already on storage_device
+                        
+                        # Get PE chunk for this video chunk
+                        pe_chunk = get_pe_chunk(pe_storage, v2a_chunk_idx, storage_device, storage_gpu_id)
+                        v_cross_pe_chunk = None
                         if pe_chunk is not None and isinstance(pe_chunk, (list, tuple)) and len(pe_chunk) > 0:
                             v_pe_pair = pe_chunk[0]
                             if isinstance(v_pe_pair, (list, tuple)) and len(v_pe_pair) > 1:
                                 v_cross_pe_chunk = v_pe_pair[1]
-                                if v_cross_pe_chunk is not None and isinstance(v_cross_pe_chunk, tuple):
-                                    v_cross_pe_chunks.append(v_cross_pe_chunk)
+                        
+                        # Get ada values for this chunk
+                        if is_chunked_tensor_list(av_ca_video_scale_shift):
+                            v_ca_ss_data, _, _, _, _ = av_ca_video_scale_shift[v2a_chunk_idx]
+                            v_ca_ss = v_ca_ss_data  # Already on storage GPU
+                        else:
+                            v_ca_ss = av_ca_video_scale_shift[:, start:end].to(storage_device) if av_ca_video_scale_shift is not None else None
+                        
+                        if is_chunked_tensor_list(av_ca_a2v_gate):
+                            v_ca_gate_data, _, _, _, _ = av_ca_a2v_gate[v2a_chunk_idx]
+                            v_ca_gate = v_ca_gate_data
+                        else:
+                            v_ca_gate = av_ca_a2v_gate[:, start:end].to(storage_device) if av_ca_a2v_gate is not None else None
+                        
+                        # Compute video ada values on storage GPU
+                        with torch.cuda.device(storage_gpu_id):
+                            # Normalize video chunk
+                            vx_norm_chunk = comfy.ldm.common_dit.rms_norm(vx_chunk)
+                            
+                            # Get scale/shift for v2a (we only need the v2a parts)
+                            (
+                                _, _,
+                                scale_v2a_chunk, shift_v2a_chunk,
+                                _,
+                            ) = block.get_av_ca_ada_values(
+                                block.scale_shift_table_a2v_ca_video.to(storage_device),
+                                vx_chunk.shape[0],
+                                v_ca_ss,
+                                v_ca_gate,
+                            )
+                            
+                            # Scale video chunk
+                            vx_scaled_chunk = vx_norm_chunk * (1 + scale_v2a_chunk) + shift_v2a_chunk
+                            
+                            # Compute K, V for this chunk
+                            vx_k = v2a_attn.to_k(vx_scaled_chunk)
+                            vx_v = v2a_attn.to_v(vx_scaled_chunk)
+                            if hasattr(v2a_attn, 'k_norm') and v2a_attn.k_norm is not None:
+                                vx_k = v2a_attn.k_norm(vx_k)
+                            
+                            # Apply RoPE to K
+                            if v_cross_pe_chunk is not None and isinstance(v_cross_pe_chunk, tuple):
+                                vx_k = apply_rotary_emb(vx_k, v_cross_pe_chunk)
+                            
+                            # Reshape K, V for attention
+                            vx_k = vx_k.view(batch_size_v2a, chunk_len, num_heads, head_dim).transpose(1, 2)
+                            vx_v = vx_v.view(batch_size_v2a, chunk_len, num_heads, head_dim).transpose(1, 2)
+                            
+                            # Compute attention scores for this chunk: (batch, heads, audio, chunk)
+                            scores_chunk = torch.matmul(ax_q_storage, vx_k.transpose(-2, -1)) * scale
+                            
+                            # Online softmax update (for numerical stability)
+                            scores_chunk_f32 = scores_chunk.float()
+                            chunk_max = scores_chunk_f32.max(dim=-1, keepdim=True).values
+                            
+                            # Move accumulators to storage GPU for update
+                            max_scores_storage = max_scores.to(storage_device)
+                            sum_exp_storage = sum_exp.to(storage_device)
+                            v2a_output_acc_storage = v2a_output_acc.to(storage_device)
+                            
+                            # Compute new max
+                            new_max = torch.maximum(max_scores_storage, chunk_max)
+                            
+                            # Update sum_exp with correction for new max
+                            exp_correction = torch.exp(max_scores_storage - new_max)
+                            sum_exp_storage = sum_exp_storage * exp_correction
+                            
+                            # Update output with correction
+                            v2a_output_acc_storage = v2a_output_acc_storage * exp_correction
+                            
+                            # Add this chunk's contribution
+                            chunk_exp = torch.exp(scores_chunk_f32 - new_max)
+                            sum_exp_storage = sum_exp_storage + chunk_exp.sum(dim=-1, keepdim=True)
+                            
+                            # Weighted values from this chunk
+                            chunk_weighted = torch.matmul(chunk_exp.to(vx_v.dtype), vx_v)
+                            v2a_output_acc_storage = v2a_output_acc_storage + chunk_weighted
+                            
+                            # Update max
+                            max_scores_storage = new_max
+                        
+                        # Move accumulators back to compute GPU
+                        max_scores = max_scores_storage.to(compute_device, non_blocking=True)
+                        sum_exp = sum_exp_storage.to(compute_device, non_blocking=True)
+                        v2a_output_acc = v2a_output_acc_storage.to(compute_device, non_blocking=True)
+                        torch.cuda.synchronize(compute_gpu)
+                        
+                        # Cleanup this chunk
+                        del ax_q_storage, vx_chunk, vx_k, vx_v, scores_chunk, pe_chunk
+                        del vx_norm_chunk, vx_scaled_chunk, chunk_exp, chunk_weighted
+                        del max_scores_storage, sum_exp_storage, v2a_output_acc_storage
+                        with torch.cuda.device(storage_gpu_id):
+                            torch.cuda.empty_cache()
                     
-                    # Concatenate video cross PE if we have chunks
-                    v_cross_pe_full = None
-                    if len(v_cross_pe_chunks) > 0:
-                        # Concatenate cos and sin separately
-                        cos_list = [pe[0] for pe in v_cross_pe_chunks if pe[0] is not None]
-                        sin_list = [pe[1] for pe in v_cross_pe_chunks if pe[1] is not None]
-                        if cos_list and sin_list:
-                            cos_full = torch.cat(cos_list, dim=2 if cos_list[0].dim() == 4 else 1)
-                            sin_full = torch.cat(sin_list, dim=2 if sin_list[0].dim() == 4 else 1)
-                            split = v_cross_pe_chunks[0][2] if len(v_cross_pe_chunks[0]) > 2 else False
-                            v_cross_pe_full = (cos_full, sin_full, split)
+                    # Final normalization
+                    v2a_output = v2a_output_acc / sum_exp.clamp(min=1e-6)
                     
-                    vx_scaled_v2a = vx_norm3_full * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
-                    ax_scaled_v2a = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
+                    # Cast back to original dtype (online softmax uses float32)
+                    v2a_output = v2a_output.to(ax_compute.dtype)
                     
-                    v2a_out = block.video_to_audio_attn(
-                        ax_scaled_v2a,
-                        context=vx_scaled_v2a,
-                        pe=a_cross_pe,
-                        k_pe=v_cross_pe_full,
-                        transformer_options=transformer_options,
-                    ) * gate_out_v2a
+                    # Reshape back: (batch, audio_seq, hidden)
+                    v2a_output = v2a_output.transpose(1, 2).contiguous().view(batch_size_v2a, audio_seq_len, -1)
                     
-                    ax_compute = ax_compute + v2a_out
+                    # Project output
+                    v2a_output = v2a_attn.to_out(v2a_output)
                     
-                    del vx_full_for_v2a, vx_norm3_full, vx_scaled_v2a, ax_scaled_v2a, v2a_out
-                    del scale_ca_video_a2v_full, shift_ca_video_a2v_full, scale_ca_video_v2a, shift_ca_video_v2a, gate_out_a2v_full
-                    del v_cross_pe_full, v_cross_pe_chunks
+                    # Apply gate and ensure dtype preserved
+                    ax_compute = ax_compute + v2a_output * gate_out_v2a
+                    ax_compute = ax_compute.to(input_dtype)  # Ensure dtype preserved
+                    
+                    # Cleanup
+                    del ax_q, ax_scaled_v2a, v2a_output, v2a_output_acc
+                    del max_scores, sum_exp
                     torch.cuda.empty_cache()
                 
                 del ax_norm3
@@ -1196,8 +1530,14 @@ def _chunked_forward_v6(
                 block.audio_scale_shift_table, batch_size, a_timestep, slice(3, None)
             )
             
+            # Ensure ada values match dtype
+            ascale_mlp = ascale_mlp.to(input_dtype)
+            ashift_mlp = ashift_mlp.to(input_dtype)
+            agate_mlp = agate_mlp.to(input_dtype)
+            
             ax_scaled = comfy.ldm.common_dit.rms_norm(ax_compute) * (1 + ascale_mlp) + ashift_mlp
             ax_compute = ax_compute + block.audio_ff(ax_scaled) * agate_mlp
+            ax_compute = ax_compute.to(input_dtype)  # Ensure dtype preserved
             del ax_scaled, ashift_mlp, ascale_mlp, agate_mlp
         
         # Sync and update vx_chunks
