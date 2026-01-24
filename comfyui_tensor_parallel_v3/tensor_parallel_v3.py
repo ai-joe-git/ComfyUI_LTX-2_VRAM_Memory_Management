@@ -18,37 +18,31 @@ logger = logging.getLogger("TensorParallelV3")
 
 
 class ChunkedFFN(nn.Module):
-    """
-    Ultra-simple FFN wrapper that processes in chunks.
-    """
-    
-    def __init__(self, num_chunks: int = 8):
+    def __init__(self, ffn, num_chunks=8):
         super().__init__()
+        self.ffn = ffn
         self.num_chunks = num_chunks
-        self._ffn_ref = None
+
+        # expose .net for compatibility
+        if hasattr(ffn, "net"):
+            self.net = ffn.net
     
     def set_ffn(self, ffn):
         self._ffn_ref = ffn
-    
+
     def forward(self, x):
-        if self._ffn_ref is None:
-            raise RuntimeError("FFN reference not set!")
-        
         batch_size, seq_len, hidden = x.shape
-        
-        # Don't chunk if sequence is short
+
         if seq_len < self.num_chunks * 100:
-            return self._ffn_ref(x)
-        
+            return self.ffn(x)
+
         chunk_size = max(1, (seq_len + self.num_chunks - 1) // self.num_chunks)
-        
+
         outputs = []
         for i in range(0, seq_len, chunk_size):
-            end_idx = min(i + chunk_size, seq_len)
-            chunk = x[:, i:end_idx, :]
-            out = self._ffn_ref(chunk)
-            outputs.append(out)
-        
+            chunk = x[:, i:i + chunk_size, :]
+            outputs.append(self.ffn(chunk))
+
         return torch.cat(outputs, dim=1)
 
 
@@ -93,7 +87,7 @@ class TensorParallelV3Pipeline:
         
         for name, original_ffn in ffn_modules.items():
             try:
-                wrapper = ChunkedFFN(self.ffn_chunks)
+                wrapper = ChunkedFFN(original_ffn, self.ffn_chunks)
                 wrapper.set_ffn(original_ffn)
                 
                 self.originals[name] = original_ffn
